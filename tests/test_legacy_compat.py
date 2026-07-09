@@ -48,6 +48,18 @@ def _restore_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tup
     return program_data, data_root
 
 
+def _backup_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[Path, Path]:
+    program_data = tmp_path / "program-data"
+    data_root = tmp_path / "utility-data"
+    monkeypatch.setattr(legacy, "PROGRAM_DATA", program_data)
+    monkeypatch.setattr(legacy, "DATA_ROOT", data_root)
+    monkeypatch.setattr(legacy, "BACKUPS_DIR", data_root / "Backups")
+    monkeypatch.setattr(legacy, "REPORTS_DIR", data_root / "Reports")
+    monkeypatch.setattr(legacy, "_processes", lambda: [])
+    monkeypatch.setattr(legacy, "get_mi03_driver", lambda: None)
+    return program_data, data_root
+
+
 def test_validate_backup_accepts_valid_archive(tmp_path: Path) -> None:
     archive = _archive(tmp_path / "valid.zip", {DEVICE_MEMBER: b"profile"})
 
@@ -88,6 +100,67 @@ def test_validate_backup_rejects_duplicate_member(tmp_path: Path) -> None:
             )
 
     with pytest.raises(ValueError, match="duplicate"):
+        legacy.validate_backup(archive)
+
+
+def test_validate_backup_rejects_case_insensitive_duplicate_members(tmp_path: Path) -> None:
+    case_variant = DEVICE_MEMBER.replace("profile.xml", "PROFILE.XML")
+    archive = tmp_path / "case-duplicate.zip"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr(DEVICE_MEMBER, b"one")
+        bundle.writestr(case_variant, b"two")
+        bundle.writestr(
+            "manifest.json",
+            json.dumps({"format": 1, "files": [_record(DEVICE_MEMBER, b"one")]}),
+        )
+
+    with pytest.raises(ValueError, match="case-insensitive duplicate"):
+        legacy.validate_backup(archive)
+
+
+@pytest.mark.parametrize(
+    "limit_name,limit_value,files,error",
+    [
+        ("MAX_ZIP_MEMBERS", 1, {DEVICE_MEMBER: b"x"}, "member-count"),
+        ("MAX_MANIFEST_SIZE", 1, {DEVICE_MEMBER: b"x"}, "manifest"),
+        ("MAX_EXPANDED_FILE_SIZE", 3, {DEVICE_MEMBER: b"four"}, "expanded-size"),
+        (
+            "MAX_TOTAL_EXPANDED_SIZE",
+            5,
+            {DEVICE_MEMBER: b"one", "data/SwitchBlade/DeathStalker/second.xml": b"two"},
+            "total expanded-size",
+        ),
+    ],
+)
+def test_validate_backup_enforces_resource_limits(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    limit_name: str,
+    limit_value: int,
+    files: dict[str, bytes],
+    error: str,
+) -> None:
+    archive = _archive(tmp_path / f"{limit_name}.zip", files)
+    monkeypatch.setattr(legacy, limit_name, limit_value)
+
+    with pytest.raises(ValueError, match=error):
+        legacy.validate_backup(archive)
+
+
+def test_validate_backup_rejects_excessive_compression_ratio(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    content = b"A" * 10_000
+    archive = tmp_path / "ratio.zip"
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
+        bundle.writestr(DEVICE_MEMBER, content)
+        bundle.writestr(
+            "manifest.json",
+            json.dumps({"format": 1, "files": [_record(DEVICE_MEMBER, content)]}),
+        )
+    monkeypatch.setattr(legacy, "MAX_COMPRESSION_RATIO", 2)
+
+    with pytest.raises(ValueError, match="compression-ratio"):
         legacy.validate_backup(archive)
 
 
@@ -183,6 +256,31 @@ def test_account_restore_requires_exactly_one_local_account(
     assert not data_root.exists()
 
 
+def test_restore_destinations_reject_windows_case_collision(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(legacy, "PROGRAM_DATA", tmp_path)
+    case_variant = DEVICE_MEMBER.replace("profile.xml", "PROFILE.XML")
+    manifest = {"format": 1, "files": [_record(DEVICE_MEMBER, b"one"), _record(case_variant, b"two")]}
+
+    with pytest.raises(ValueError, match="Windows destination"):
+        legacy._restore_destinations(manifest)
+
+
+def test_restore_rejects_reparse_point_in_destination_chain(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    program_data, data_root = _restore_environment(monkeypatch, tmp_path)
+    archive = _archive(tmp_path / "restore.zip", {DEVICE_MEMBER: b"profile"})
+    blocked = program_data / "Razer" / "Synapse"
+    monkeypatch.setattr(legacy, "_is_reparse_point", lambda path: path == blocked)
+    blocked.mkdir(parents=True)
+    monkeypatch.setattr(legacy, "create_backup", lambda **_kwargs: pytest.fail("backup must not run"))
+
+    with pytest.raises(RuntimeError, match="reparse point"):
+        legacy.restore_backup(archive, confirmed=True)
+
+    assert not data_root.exists()
+
+
 def test_pre_restore_backup_failure_changes_no_destination(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -248,15 +346,31 @@ def test_successful_restore_writes_declared_files_and_safe_journal(
     assert all(entry["archive_path"] == "restore.zip" for entry in entries)
 
 
-def test_mid_restore_failure_is_journaled_and_keeps_unrelated_files(
+def test_mid_restore_failure_rolls_back_existing_and_new_files(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     program_data, data_root = _restore_environment(monkeypatch, tmp_path)
     unrelated = program_data / "Razer" / "SwitchBlade" / "DeathStalker" / "unrelated.xml"
     unrelated.parent.mkdir(parents=True)
     unrelated.write_bytes(b"keep")
+    original = (
+        program_data
+        / "Razer"
+        / "Synapse"
+        / "Devices"
+        / "DeathStalker Ultimate"
+        / "Profiles"
+        / "profile.xml"
+    )
+    original.parent.mkdir(parents=True)
+    original.write_bytes(b"original")
     second = "data/SwitchBlade/DeathStalker/second.xml"
-    archive = _archive(tmp_path / "restore.zip", {DEVICE_MEMBER: b"one", second: b"two"})
+    third = "data/SwitchBlade/DeathStalker/third.xml"
+    second_destination = program_data / "Razer" / "SwitchBlade" / "DeathStalker" / "second.xml"
+    archive = _archive(
+        tmp_path / "restore.zip",
+        {DEVICE_MEMBER: b"one", second: b"two", third: b"three"},
+    )
     monkeypatch.setattr(
         legacy,
         "create_backup",
@@ -268,7 +382,7 @@ def test_mid_restore_failure_is_journaled_and_keeps_unrelated_files(
     def fail_second(source, destination):
         nonlocal calls
         calls += 1
-        if calls == 2:
+        if calls == 3:
             raise OSError("simulated replacement failure")
         return real_replace(source, destination)
 
@@ -277,13 +391,109 @@ def test_mid_restore_failure_is_journaled_and_keeps_unrelated_files(
     with pytest.raises(OSError, match="simulated"):
         legacy.restore_backup(archive, confirmed=True)
 
+    assert original.read_bytes() == b"original"
+    assert not second_destination.exists()
     assert unrelated.read_bytes() == b"keep"
     journals = list((data_root / "Journals").glob("*.jsonl"))
     assert len(journals) == 1
     entries = [json.loads(line) for line in journals[0].read_text(encoding="utf-8").splitlines()]
-    assert entries[-1]["event"] == "restore_failed"
+    assert [entry["event"] for entry in entries[-5:]] == [
+        "rollback_started",
+        "file_rollback_succeeded",
+        "file_rollback_succeeded",
+        "rollback_completed",
+        "restore_failed",
+    ]
     assert entries[-1]["exception_type"] == "OSError"
     assert "simulated replacement failure" not in entries[-1]["message"]
+    assert str(program_data) not in journals[0].read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("account_count", [0, 1])
+def test_backup_accepts_zero_or_one_account_with_eligible_data(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, account_count: int
+) -> None:
+    program_data, _data_root = _backup_environment(monkeypatch, tmp_path)
+    accounts = program_data / "Razer" / "Synapse" / "Accounts"
+    for index in range(account_count):
+        macros = accounts / f"private-{index}" / "Macros"
+        macros.mkdir(parents=True)
+        (macros / "same.xml").write_bytes(b"macro")
+
+    archive = legacy.create_backup(export_driver=False)
+
+    manifest = legacy.validate_backup(archive)
+    assert len(manifest["files"]) == account_count
+    assert all("private-" not in record["path"] for record in manifest["files"])
+
+
+def test_backup_refuses_multiple_accounts_with_overlapping_eligible_names(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    program_data, data_root = _backup_environment(monkeypatch, tmp_path)
+    accounts = program_data / "Razer" / "Synapse" / "Accounts"
+    for index in range(2):
+        macros = accounts / f"private-{index}" / "Macros"
+        macros.mkdir(parents=True)
+        (macros / "same.xml").write_bytes(f"macro-{index}".encode())
+
+    with pytest.raises(RuntimeError, match="more than one Synapse account"):
+        legacy.create_backup(export_driver=False)
+
+    assert list((data_root / "Backups").glob("*.zip")) == []
+
+
+def test_artifacts_do_not_collide_when_created_at_the_same_instant(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _program_data, data_root = _backup_environment(monkeypatch, tmp_path)
+    monkeypatch.setattr(legacy, "JOURNALS_DIR", data_root / "Journals")
+
+    backups = [legacy.create_backup(export_driver=False) for _ in range(2)]
+    reports = [legacy.write_report({"ready": False}) for _ in range(2)]
+    journals = [legacy._reserve_artifact_file(legacy.JOURNALS_DIR, "restore", ".jsonl") for _ in range(2)]
+
+    assert len(set(backups)) == len(set(reports)) == len(set(journals)) == 2
+    assert all(path.exists() for path in backups + reports + journals)
+
+
+def test_artifact_reservation_never_overwrites_existing_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    tokens = iter(["collision", "unique"])
+    monkeypatch.setattr(legacy, "_artifact_token", lambda: next(tokens))
+    existing = tmp_path / "artifact-collision.json"
+    existing.write_text("keep", encoding="utf-8")
+
+    reserved = legacy._reserve_artifact_file(tmp_path, "artifact", ".json")
+
+    assert existing.read_text(encoding="utf-8") == "keep"
+    assert reserved.name == "artifact-unique.json"
+
+
+def test_driver_export_directories_do_not_collide(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _program_data, data_root = _backup_environment(monkeypatch, tmp_path)
+    monkeypatch.setattr(legacy, "get_mi03_driver", lambda: {"InfName": "razer.inf"})
+    exported: list[Path] = []
+
+    class Result:
+        returncode = 0
+        stderr = ""
+        stdout = ""
+
+    def fake_run(command, **_kwargs):
+        exported.append(Path(command[-1]))
+        return Result()
+
+    monkeypatch.setattr(legacy.subprocess, "run", fake_run)
+
+    legacy.create_backup(export_driver=True)
+    legacy.create_backup(export_driver=True)
+
+    assert len(set(exported)) == 2
+    assert all(path.parent == data_root / "Backups" for path in exported)
 
 
 def test_cli_restore_requires_confirm(monkeypatch: pytest.MonkeyPatch, capsys) -> None:
