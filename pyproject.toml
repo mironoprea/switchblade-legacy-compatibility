@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "switchblade-legacy-compatibility"
+version = "0.1.0"
+description = "Unofficial compatibility and recovery utility for an existing Razer Synapse 2 SwitchBlade stack"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{name = "mironoprea"}]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "Pillow>=10"]
+hardware = ["Pillow>=10", "psutil>=5.9", "frida>=16"]
+
+[project.scripts]
+switchblade-legacy = "app.legacy_compat:main"
+
+[tool.setuptools]
+packages = ["app"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

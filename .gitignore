@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+build/
+dist/
+*.log
+
+# User-owned backups, reports, journals, and generated helper binaries
+Backups/
+Reports/
+Journals/
+*.exe
+*.dll
+*.inf
+*.zip
+
+# Local hardware evidence may contain personal information
+captures/*
+!captures/README.md
