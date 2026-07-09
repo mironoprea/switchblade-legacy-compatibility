@@ -46,6 +46,43 @@ _ACCOUNT_PREFIX = "Synapse/Accounts/User/"
 _ALLOWED_NAMES = {"config.xml", "profiles.json"}
 _ALLOWED_SUFFIXES = {".xml", ".png", ".jpg", ".jpeg", ".bmp", ".rzdisplaystate"}
 
+# Validate resource use from ZIP metadata before reading any member into memory.
+MAX_ZIP_MEMBERS = 1_024
+MAX_MANIFEST_SIZE = 1 * 1024 * 1024
+MAX_EXPANDED_FILE_SIZE = 64 * 1024 * 1024
+MAX_TOTAL_EXPANDED_SIZE = 256 * 1024 * 1024
+MAX_COMPRESSION_RATIO = 100
+
+
+def _artifact_token() -> str:
+    return uuid.uuid4().hex
+
+
+def _reserve_artifact_file(directory: Path, prefix: str, suffix: str) -> Path:
+    """Exclusively reserve a collision-resistant artifact path."""
+    directory.mkdir(parents=True, exist_ok=True)
+    for _attempt in range(10):
+        path = directory / f"{prefix}-{_artifact_token()}{suffix}"
+        try:
+            descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            continue
+        os.close(descriptor)
+        return path
+    raise FileExistsError("Could not reserve a unique utility artifact")
+
+
+def _create_artifact_directory(directory: Path, prefix: str) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    for _attempt in range(10):
+        path = directory / f"{prefix}-{_artifact_token()}"
+        try:
+            path.mkdir()
+        except FileExistsError:
+            continue
+        return path
+    raise FileExistsError("Could not create a unique utility artifact directory")
+
 
 def _powershell_json(script: str):
     result = subprocess.run(
@@ -122,17 +159,27 @@ def _backup_candidates() -> list[tuple[Path, str]]:
         candidates.append((device_profiles, "Synapse/Devices/DeathStalker Ultimate/Profiles"))
     accounts = razer / "Synapse" / "Accounts"
     if accounts.is_dir():
+        account_candidates: list[list[tuple[Path, str]]] = []
         for account in accounts.iterdir():
             if not account.is_dir():
                 continue
+            scoped: list[tuple[Path, str]] = []
             for relative in (
                 Path("Devices") / "DeathStalker Ultimate" / "Profiles",
                 Path("Macros"),
             ):
                 source = account / relative
-                if source.is_dir():
+                if source.is_dir() and any(_iter_backup_files(source)):
                     # Account directory names are replaced with a stable neutral label.
-                    candidates.append((source, f"Synapse/Accounts/User/{relative.as_posix()}"))
+                    scoped.append((source, f"Synapse/Accounts/User/{relative.as_posix()}"))
+            if scoped:
+                account_candidates.append(scoped)
+        if len(account_candidates) > 1:
+            raise RuntimeError(
+                "Backup refused because more than one Synapse account contains eligible data"
+            )
+        if account_candidates:
+            candidates.extend(account_candidates[0])
     switchblade_state = razer / "SwitchBlade" / "DeathStalker"
     if switchblade_state.is_dir():
         candidates.append((switchblade_state, "SwitchBlade/DeathStalker"))
@@ -199,15 +246,22 @@ def validate_backup(archive: Path) -> dict:
     try:
         with zipfile.ZipFile(archive, "r") as bundle:
             infos = bundle.infolist()
+            if len(infos) > MAX_ZIP_MEMBERS:
+                raise ValueError("Backup exceeds the ZIP member-count limit")
             names = [info.filename for info in infos]
             for name in names:
                 _safe_member_parts(name)
-            if len(names) != len(set(names)):
-                raise ValueError("Backup contains duplicate ZIP member names")
+            folded_names = [name.casefold() for name in names]
+            if len(folded_names) != len(set(folded_names)):
+                raise ValueError("Backup contains case-insensitive duplicate ZIP member names")
             if names.count("manifest.json") != 1:
                 raise ValueError("Backup must contain exactly one manifest.json")
+            manifest_info = bundle.getinfo("manifest.json")
+            if manifest_info.file_size > MAX_MANIFEST_SIZE:
+                raise ValueError("Backup manifest exceeds the size limit")
+            _validate_compression_ratio(manifest_info)
             try:
-                manifest = json.loads(bundle.read("manifest.json"))
+                manifest = json.loads(bundle.read(manifest_info))
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
                 raise ValueError("Backup manifest is not valid JSON") from exc
             if not isinstance(manifest, dict) or manifest.get("format") != 1:
@@ -217,6 +271,8 @@ def validate_backup(archive: Path) -> dict:
                 raise ValueError("Backup manifest files must be a list")
 
             declared: set[str] = set()
+            declared_folded: set[str] = set()
+            total_expanded = 0
             info_by_name = {info.filename: info for info in infos}
             for record in records:
                 if not isinstance(record, dict):
@@ -236,12 +292,21 @@ def validate_backup(archive: Path) -> dict:
                     raise ValueError("Backup manifest contains a malformed file record")
                 if member in declared:
                     raise ValueError(f"Backup manifest declares a member more than once: {member}")
+                if member.casefold() in declared_folded:
+                    raise ValueError("Backup manifest contains a case-insensitive path collision")
                 declared.add(member)
+                declared_folded.add(member.casefold())
                 if not _allowed_restore_member(member):
                     raise ValueError(f"Backup member is not on the restore allowlist: {member}")
                 info = info_by_name.get(member)
                 if info is None:
                     raise ValueError(f"Declared backup member is missing: {member}")
+                if size > MAX_EXPANDED_FILE_SIZE or info.file_size > MAX_EXPANDED_FILE_SIZE:
+                    raise ValueError("Backup member exceeds the expanded-size limit")
+                total_expanded += info.file_size
+                if total_expanded > MAX_TOTAL_EXPANDED_SIZE:
+                    raise ValueError("Backup exceeds the total expanded-size limit")
+                _validate_compression_ratio(info)
                 content = bundle.read(info)
                 if info.file_size != size or len(content) != size:
                     raise ValueError(f"Backup member size does not match its manifest: {member}")
@@ -260,6 +325,13 @@ def validate_backup(archive: Path) -> dict:
             return manifest
     except zipfile.BadZipFile as exc:
         raise ValueError("Backup is not a valid ZIP archive") from exc
+
+
+def _validate_compression_ratio(info: zipfile.ZipInfo) -> None:
+    if info.file_size and (
+        info.compress_size == 0 or info.file_size / info.compress_size > MAX_COMPRESSION_RATIO
+    ):
+        raise ValueError("Backup member exceeds the compression-ratio limit")
 
 
 def _restore_destinations(manifest: dict) -> list[tuple[str, Path]]:
@@ -292,7 +364,31 @@ def _restore_destinations(manifest: dict) -> list[tuple[str, Path]]:
         member = record["path"]
         root, relative = _split_logical_path(member)
         destinations.append((member, roots[root].joinpath(*relative)))
+    folded = [str(destination).replace("/", "\\").casefold() for _member, destination in destinations]
+    if len(folded) != len(set(folded)):
+        raise ValueError("Backup maps multiple members to the same Windows destination")
     return destinations
+
+
+def _is_reparse_point(path: Path) -> bool:
+    try:
+        stat_result = path.lstat()
+    except FileNotFoundError:
+        return False
+    attributes = getattr(stat_result, "st_file_attributes", 0)
+    reparse_flag = getattr(stat_result, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return path.is_symlink() or bool(attributes & reparse_flag)
+
+
+def _assert_no_reparse_points(destination: Path) -> None:
+    current = destination
+    while True:
+        if current.exists() or current.is_symlink():
+            if _is_reparse_point(current):
+                raise RuntimeError("Restore destination path contains a reparse point")
+        if current == current.parent:
+            break
+        current = current.parent
 
 
 def _journal_destination(member: str) -> str:
@@ -324,11 +420,14 @@ def restore_backup(archive: Path, *, confirmed: bool = False) -> Path:
     archive = Path(archive)
     manifest = validate_backup(archive)
     destinations = _restore_destinations(manifest)
+    for _member, destination in destinations:
+        _assert_no_reparse_points(destination)
     operation_id = uuid.uuid4().hex
-    JOURNALS_DIR.mkdir(parents=True, exist_ok=True)
-    journal = JOURNALS_DIR / f"restore-{operation_id}.jsonl"
+    journal = _reserve_artifact_file(JOURNALS_DIR, "restore", ".jsonl")
     _append_journal(journal, operation_id, "restore_started", archive)
     staging: Path | None = None
+    rollback_state: list[tuple[str, Path, Path | None]] = []
+    changed: list[tuple[str, Path, Path | None]] = []
     try:
         pre_restore = create_backup(export_driver=False)
         _append_journal(
@@ -341,17 +440,29 @@ def restore_backup(archive: Path, *, confirmed: bool = False) -> Path:
         staging = Path(tempfile.mkdtemp(prefix=f"restore-{operation_id}-", dir=DATA_ROOT))
         with zipfile.ZipFile(archive, "r") as bundle:
             staged_files: dict[str, Path] = {}
-            for index, (member, _destination) in enumerate(destinations):
+            for index, (member, destination) in enumerate(destinations):
                 staged = staging / f"{index:08d}.stage"
                 staged.write_bytes(bundle.read(member))
                 staged_files[member] = staged
+                original: Path | None = None
+                _assert_no_reparse_points(destination)
+                if destination.exists():
+                    if not destination.is_file():
+                        raise RuntimeError("Restore destination exists but is not a regular file")
+                    original = staging / f"{index:08d}.original"
+                    shutil.copy2(destination, original)
+                rollback_state.append((member, destination, original))
 
-        for member, destination in destinations:
+        for member, destination, original in rollback_state:
+            _assert_no_reparse_points(destination)
             destination.parent.mkdir(parents=True, exist_ok=True)
+            _assert_no_reparse_points(destination)
             temporary = destination.parent / f".{destination.name}.{operation_id}.tmp"
             try:
                 shutil.copyfile(staged_files[member], temporary)
+                _assert_no_reparse_points(destination)
                 os.replace(temporary, destination)
+                changed.append((member, destination, original))
             finally:
                 if temporary.exists():
                     temporary.unlink()
@@ -366,6 +477,47 @@ def restore_backup(archive: Path, *, confirmed: bool = False) -> Path:
         _append_journal(journal, operation_id, "restore_completed", archive)
         return journal
     except Exception as exc:
+        rollback_error: Exception | None = None
+        if changed:
+            _append_journal(journal, operation_id, "rollback_started", archive)
+            for member, destination, original in reversed(changed):
+                try:
+                    _assert_no_reparse_points(destination)
+                    if original is None:
+                        destination.unlink(missing_ok=True)
+                    else:
+                        rollback_temporary = destination.parent / f".{destination.name}.{operation_id}.rollback"
+                        try:
+                            shutil.copy2(original, rollback_temporary)
+                            _assert_no_reparse_points(destination)
+                            os.replace(rollback_temporary, destination)
+                        finally:
+                            rollback_temporary.unlink(missing_ok=True)
+                    _append_journal(
+                        journal,
+                        operation_id,
+                        "file_rollback_succeeded",
+                        archive,
+                        logical_path=member,
+                        destination_path=_journal_destination(member),
+                    )
+                except Exception as current_error:
+                    rollback_error = rollback_error or current_error
+                    _append_journal(
+                        journal,
+                        operation_id,
+                        "file_rollback_failed",
+                        archive,
+                        logical_path=member,
+                        destination_path=_journal_destination(member),
+                        exception_type=type(current_error).__name__,
+                    )
+            _append_journal(
+                journal,
+                operation_id,
+                "rollback_completed" if rollback_error is None else "rollback_failed",
+                archive,
+            )
         _append_journal(
             journal,
             operation_id,
@@ -374,6 +526,8 @@ def restore_backup(archive: Path, *, confirmed: bool = False) -> Path:
             exception_type=type(exc).__name__,
             message="Restore failed; sensitive filesystem details were omitted",
         )
+        if rollback_error is not None:
+            raise RuntimeError("Restore failed and automatic rollback was incomplete") from exc
         raise
     finally:
         if staging is not None:
@@ -402,9 +556,7 @@ def create_backup(*, export_driver: bool = True, allow_live: bool = False) -> Pa
             "Close the legacy Razer processes before backup, or explicitly use --live. "
             f"Running: {', '.join(running)}"
         )
-    BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    archive = BACKUPS_DIR / f"legacy-config-{stamp}.zip"
+    archive = _reserve_artifact_file(BACKUPS_DIR, "legacy-config", ".zip")
     manifest: dict = {
         "format": 1,
         "created_utc": datetime.now(timezone.utc).isoformat(),
@@ -413,29 +565,33 @@ def create_backup(*, export_driver: bool = True, allow_live: bool = False) -> Pa
         "files": [],
         "excluded": ["credentials", "RazerLoginData.xml", "analytics", "logs", "installed binaries"],
     }
-    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
-        seen: set[str] = set()
-        for source, logical_root in _backup_candidates():
-            for item in _iter_backup_files(source):
-                relative = item.relative_to(source).as_posix()
-                archive_name = f"data/{logical_root}/{relative}"
-                if archive_name in seen:
-                    continue
-                seen.add(archive_name)
-                content = item.read_bytes()
-                bundle.writestr(archive_name, content)
-                manifest["files"].append(
-                    {"path": archive_name, "size": len(content), "sha256": hashlib.sha256(content).hexdigest()}
-                )
-        bundle.writestr("manifest.json", json.dumps(manifest, indent=2, sort_keys=True))
+    try:
+        with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
+            seen: set[str] = set()
+            for source, logical_root in _backup_candidates():
+                for item in _iter_backup_files(source):
+                    relative = item.relative_to(source).as_posix()
+                    archive_name = f"data/{logical_root}/{relative}"
+                    folded_name = archive_name.casefold()
+                    if folded_name in seen:
+                        raise RuntimeError("Backup source contains a Windows case-insensitive path collision")
+                    seen.add(folded_name)
+                    content = item.read_bytes()
+                    bundle.writestr(archive_name, content)
+                    manifest["files"].append(
+                        {"path": archive_name, "size": len(content), "sha256": hashlib.sha256(content).hexdigest()}
+                    )
+            bundle.writestr("manifest.json", json.dumps(manifest, indent=2, sort_keys=True))
+    except Exception:
+        archive.unlink(missing_ok=True)
+        raise
 
     # Driver export is intentionally separate from the ZIP: it is a local rollback
     # copy of the user's installed proprietary package and is never distributed.
     driver = manifest.get("mi03_driver") or {}
     inf = driver.get("InfName")
     if export_driver and inf:
-        driver_dir = BACKUPS_DIR / f"driver-{stamp}"
-        driver_dir.mkdir(parents=True, exist_ok=True)
+        driver_dir = _create_artifact_directory(BACKUPS_DIR, "driver")
         result = subprocess.run(
             ["pnputil", "/export-driver", inf, str(driver_dir)],
             capture_output=True,
@@ -489,8 +645,7 @@ def launch_configurator(timeout: float = 15.0) -> bool:
 
 
 def write_report(status: dict) -> Path:
-    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    path = REPORTS_DIR / f"diagnostic-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+    path = _reserve_artifact_file(REPORTS_DIR, "diagnostic", ".json")
     path.write_text(json.dumps(status, indent=2, sort_keys=True, default=str), encoding="utf-8")
     return path
 
