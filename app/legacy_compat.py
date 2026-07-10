@@ -24,6 +24,7 @@ import uuid
 import zipfile
 
 from app import inventory
+from app import repair
 
 VID = "1532"
 PID = "0114"
@@ -642,6 +643,21 @@ def write_report(status: dict) -> Path:
     return path
 
 
+def _repair_journal(plan: repair.RepairPlan):
+    """Create a privacy-safe repair journal without recording paths or commands."""
+    path = _reserve_artifact_file(JOURNALS_DIR, "repair", ".jsonl")
+    operation_id = uuid.uuid4().hex
+
+    def append(event: str, fields: dict[str, object]) -> None:
+        allowed = {key: value for key, value in fields.items() if key in {"action_id", "action_ids", "exception_type", "classification", "recovery"}}
+        entry = {"timestamp_utc": datetime.now(timezone.utc).isoformat(), "operation_id": operation_id, "event": event, **allowed}
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(entry, sort_keys=True) + "\n")
+
+    append("repair_plan_created", {"action_ids": [action.action_id for action in plan.actions]})
+    return path, append
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -653,7 +669,8 @@ def main() -> int:
     restore = commands.add_parser("restore", help="Validate and restore a legacy configuration backup")
     restore.add_argument("archive", type=Path)
     restore.add_argument("--confirm", action="store_true", help="confirm that the validated backup should be restored")
-    commands.add_parser("repair", help="Back up, validate, and launch without redistributing Razer files")
+    repair_command = commands.add_parser("repair", help="Print a bounded repair plan before any mutation")
+    repair_command.add_argument("--confirm", action="store_true", help="confirm the printed repair plan")
     args = parser.parse_args()
 
     if args.command == "scan":
@@ -678,19 +695,30 @@ def main() -> int:
     if args.command == "repair":
         status = scan()
         report = write_report(status)
-        stop_legacy_processes()
-        backup_path = create_backup(export_driver=True)
-        if not status["ready"]:
-            print(json.dumps(status, indent=2, default=str))
-            print("The installed stack is incomplete or MI_03 is not on the Razer driver; no automatic system changes were made.")
-            print(f"Backup: {backup_path}")
-            print(f"Report: {report}")
-            return 1
-        opened = launch_configurator()
-        print(f"Backup: {backup_path}")
+        plan = repair.build_plan(status)
+        journal, append_journal = _repair_journal(plan)
+        print(json.dumps(plan.public(), indent=2, sort_keys=True))
         print(f"Report: {report}")
-        print("Compatibility launch succeeded." if opened else "Installed components passed, but the window did not appear.")
-        return 0 if opened else 1
+        print(f"Journal: {journal}")
+        if not args.confirm:
+            print("Dry run only; pass --confirm only after reviewing this entire plan.")
+            return 0 if plan.classification == "healthy" else inventory.EXIT_CODES.get(plan.classification, 3)
+        # Current inventory cannot verify exact installer identity, so any mutation-capable
+        # plan is blocked before this point. Keep execution wiring explicit for that future gate.
+        result = repair.execute_plan(
+            plan,
+            confirmed=True,
+            dependencies=repair.RepairDependencies(
+                create_backup=create_backup,
+                stop_processes=stop_legacy_processes,
+                launch_configurator=launch_configurator,
+                rerun_inventory=scan,
+                run_action=lambda _action: (_ for _ in ()).throw(RuntimeError("No verified repair actions registered")),
+                journal=append_journal,
+            ),
+        )
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0 if result["outcome"] == "completed" else 3
     return 2
 
 
