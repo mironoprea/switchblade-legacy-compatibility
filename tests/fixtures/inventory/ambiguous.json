@@ -1,0 +1,8 @@
+{
+  "os_supported": true,
+  "drivers": [
+    {"DeviceID": "USB\\VID_1532&PID_0114&MI_03", "DriverProviderName": "Razer", "Manufacturer": "Razer", "InfName": "razer.inf", "DeviceName": "DeathStalker", "IsSigned": true},
+    {"DeviceID": "USB\\VID_1532&PID_0114&MI_03", "DriverProviderName": "Razer", "Manufacturer": "Razer", "InfName": "razer.inf", "DeviceName": "DeathStalker", "IsSigned": true}
+  ],
+  "files": {}, "processes": [], "services": [], "com": {}, "packages": ["not-razer.exe"]
+}
