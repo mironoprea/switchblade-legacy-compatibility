@@ -1,0 +1,9 @@
+{
+  "os_supported": true,
+  "drivers": [{"DeviceID": "USB\\VID_1532&PID_0114&MI_03", "DriverProviderName": "Razer Inc.", "Manufacturer": "Razer", "InfName": "razerkbd.inf", "DeviceName": "DeathStalker Ultimate", "IsSigned": true}],
+  "files": {"synapse": true, "app_manager": true, "sdk": true, "profiles": true},
+  "processes": ["RzSynapse"],
+  "services": [{"Name": "RzAppManager", "Status": "Running"}],
+  "com": {"RzSwitchbladeSDK": true, "RzSwitchbladeSDK2": true},
+  "packages": ["Razer_Synapse_Installer.msi"]
+}

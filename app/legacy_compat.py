@@ -23,6 +23,8 @@ import time
 import uuid
 import zipfile
 
+from app import inventory
+
 VID = "1532"
 PID = "0114"
 MI03_PATTERN = "VID_1532&PID_0114&MI_03"
@@ -124,30 +126,12 @@ def _processes() -> list[str]:
 
 
 def scan() -> dict:
-    driver = get_mi03_driver()
-    sdk = PROGRAM_DATA / "Razer" / "SwitchBlade" / "SDK" / "RzSwitchbladeSDK2.dll"
-    profile_dir = PROGRAM_DATA / "Razer" / "Synapse" / "Devices" / "DeathStalker Ultimate" / "Profiles"
-    status = {
-        "product": "Switchblade Legacy Compatibility (Unofficial)",
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-        "synapse_executable": str(SYNAPSE_EXE),
-        "synapse_installed": SYNAPSE_EXE.is_file(),
-        "switchblade_manager_installed": APP_MANAGER_EXE.is_file(),
-        "sdk_installed": sdk.is_file(),
-        "device_profiles_present": profile_dir.is_dir() and any(profile_dir.glob("*.xml")),
-        "mi03_driver": driver,
-        "mi03_is_razer": bool(driver and driver.get("DriverProviderName") == "Razer Inc"),
-        "legacy_processes": _processes(),
-    }
-    status["ready"] = all(
-        [
-            status["synapse_installed"],
-            status["switchblade_manager_installed"],
-            status["sdk_installed"],
-            status["device_profiles_present"],
-            status["mi03_is_razer"],
-        ]
-    )
+    evidence = inventory.collect_evidence(razer_root=RAZER_ROOT, program_data=PROGRAM_DATA)
+    result = inventory.classify(evidence)
+    status = inventory.public_report(evidence, result)
+    status["product"] = "Switchblade Legacy Compatibility (Unofficial)"
+    status["timestamp_utc"] = datetime.now(timezone.utc).isoformat()
+    status["ready"] = status["classification"] == "healthy"
     return status
 
 
@@ -646,7 +630,15 @@ def launch_configurator(timeout: float = 15.0) -> bool:
 
 def write_report(status: dict) -> Path:
     path = _reserve_artifact_file(REPORTS_DIR, "diagnostic", ".json")
-    path.write_text(json.dumps(status, indent=2, sort_keys=True, default=str), encoding="utf-8")
+    allowed = {
+        key: status[key]
+        for key in (
+            "product", "timestamp_utc", "classification", "reason_codes", "next_steps", "device",
+            "components", "services", "processes_running", "com_registrations", "official_package_candidates",
+        )
+        if key in status
+    }
+    path.write_text(json.dumps(allowed, indent=2, sort_keys=True), encoding="utf-8")
     return path
 
 
@@ -669,7 +661,7 @@ def main() -> int:
         report = write_report(status)
         print(json.dumps(status, indent=2, default=str))
         print(f"Report: {report}")
-        return 0 if status["ready"] else 1
+        return inventory.EXIT_CODES[status["classification"]]
     if args.command == "launch":
         ok = launch_configurator()
         print("Razer Configurator opened." if ok else "Razer Configurator did not appear.")
@@ -685,15 +677,18 @@ def main() -> int:
         return 0
     if args.command == "repair":
         status = scan()
+        report = write_report(status)
         stop_legacy_processes()
         backup_path = create_backup(export_driver=True)
         if not status["ready"]:
             print(json.dumps(status, indent=2, default=str))
             print("The installed stack is incomplete or MI_03 is not on the Razer driver; no automatic system changes were made.")
             print(f"Backup: {backup_path}")
+            print(f"Report: {report}")
             return 1
         opened = launch_configurator()
         print(f"Backup: {backup_path}")
+        print(f"Report: {report}")
         print("Compatibility launch succeeded." if opened else "Installed components passed, but the window did not appear.")
         return 0 if opened else 1
     return 2
