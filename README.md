@@ -49,6 +49,7 @@ switchblade-legacy backup --no-driver
 switchblade-legacy launch
 switchblade-legacy restore path\to\legacy-config.zip --confirm
 switchblade-legacy repair
+switchblade-legacy-ui
 ```
 
 `scan` is read-only. `backup` writes only under
@@ -57,6 +58,13 @@ installed MI_03 driver with `pnputil`. `restore` writes allowlisted configuratio
 files under `%PROGRAMDATA%\Razer` only after validation and explicit confirmation.
 `repair` force-stops three legacy Razer processes in the current implementation;
 do not present it as consumer-safe until the gates in `BUILD_PLAN.md` pass.
+
+The desktop UI is an unofficial, unsigned convenience layer. It keeps operations
+off the UI thread, shows bounded repair proposals before confirmation, and stores
+rotating privacy-safe logs under the utility's per-user data root. The Windows
+installer contains only this utility; uninstall preserves Razer software and all
+per-user backups, reports, journals, and logs. See
+[`docs/RELEASE_ACCEPTANCE.md`](docs/RELEASE_ACCEPTANCE.md) before any release.
 
 ## Safety boundary
 
