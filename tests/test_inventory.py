@@ -47,7 +47,9 @@ def test_collection_handles_powershell_failure_and_malformed_output(tmp_path: Pa
     def failing(_script: str):
         raise RuntimeError("private command output")
 
-    evidence = inventory.collect_evidence(razer_root=tmp_path, program_data=tmp_path, powershell_json=failing)
+    evidence = inventory.collect_evidence(
+        razer_root=tmp_path, program_data=tmp_path, powershell_json=failing, is_windows=True
+    )
     assert inventory.classify(evidence)["reason_codes"] == ["windows_query_failed"]
 
 

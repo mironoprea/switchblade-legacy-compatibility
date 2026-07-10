@@ -50,9 +50,12 @@ def collect_evidence(
     razer_root: Path,
     program_data: Path,
     powershell_json=_powershell_json,
+    is_windows: bool | None = None,
 ) -> dict[str, object]:
     """Collect only the minimum data needed to classify the legacy installation."""
-    if os.name != "nt":
+    if is_windows is None:
+        is_windows = os.name == "nt"
+    if not is_windows:
         return {"os_supported": False, "collection_error": "unsupported_os"}
 
     try:
