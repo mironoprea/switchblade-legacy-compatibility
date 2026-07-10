@@ -1,0 +1,28 @@
+name: Windows package
+
+on:
+  pull_request:
+  push:
+
+jobs:
+  package:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[dev]" "pyinstaller==6.11.1"
+      - run: python -m pytest -q tests/test_ui.py tests/test_packaging.py
+      - run: choco install innosetup --no-progress --limit-output
+      - run: .\scripts\package_smoke.ps1 -BuildInstaller
+      - run: |
+          $installer = Get-ChildItem .\dist\installer\*.exe | Select-Object -First 1
+          if (-not $installer) { throw "Installer artifact missing." }
+          $installer.FullName
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SwitchbladeLegacyCompatibilitySetup
+          path: dist/installer/SwitchbladeLegacyCompatibilitySetup.exe
+          if-no-files-found: error

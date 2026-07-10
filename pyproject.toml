@@ -27,6 +27,7 @@ hardware = ["Pillow>=10", "psutil>=5.9", "frida>=16"]
 
 [project.scripts]
 switchblade-legacy = "app.legacy_compat:main"
+switchblade-legacy-ui = "app.ui:main"
 
 [tool.setuptools]
 packages = ["app"]

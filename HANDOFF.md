@@ -73,6 +73,16 @@ No prior screenshots or photos are carried into this repository because some
 contained personal account or conversation content. Generate fresh local evidence,
 inspect it, and commit only deliberately sanitized reference material.
 
+## 2026-07-10 acceptance result
+
+- The installed launcher successfully produced the exact `Razer Configurator`
+  window without a reboot during this session.
+- Hardware acceptance failed: the trackpad was non-functional and the ten LCD
+  keys were reported as unstable/janky. No driver, process, configuration, or
+  brightness mutation was attempted after this report.
+- The required post-reboot and remaining hardware gates are not complete. This
+  failure blocks consumer-ready status, release, and merge for issue #4.
+
 ## Last known test result
 
 In the source workspace, `python -m pytest tests/test_legacy_compat.py -q` passed
